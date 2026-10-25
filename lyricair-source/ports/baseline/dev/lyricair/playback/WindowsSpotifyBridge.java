@@ -7,11 +7,16 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
 import java.util.Base64;
 
 /** A daemon reads newline-delimited JSON from an embedded, read-only Windows media helper. */
@@ -30,8 +35,17 @@ public final class WindowsSpotifyBridge implements AutoCloseable {
 
     public synchronized void start(Path directory) {
         close();
-        if (!System.getProperty("os.name", "").toLowerCase(Locale.ROOT).startsWith("windows")) {
-            status = "Spotify desktop sync needs Windows 10/11. Demo still works.";
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        if (os.contains("linux")) {
+            running = true;
+            status = "Connecting to Spotify desktop...";
+            worker = new Thread(this::mprisLoop, "lyricair-spotify");
+            worker.setDaemon(true);
+            worker.start();
+            return;
+        }
+        if (!os.startsWith("windows")) {
+            status = "Spotify desktop sync needs Windows 10/11 or Linux. Demo still works.";
             return;
         }
         try {
@@ -92,6 +106,95 @@ public final class WindowsSpotifyBridge implements AutoCloseable {
             try { Thread.sleep(5_000); }
             catch (InterruptedException e) { owner.interrupt(); }
         }
+    }
+
+    // Linux: poll the MPRIS D-Bus interface of Spotify through busctl (part of systemd, no extra packages).
+    private static final String MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player";
+    private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build();
+
+    private void mprisLoop() {
+        Thread owner = Thread.currentThread();
+        String coverUrl = "";
+        while (running && !owner.isInterrupted()) {
+            try {
+                JsonObject props = mprisProperties();
+                synchronized (this) {
+                    if (worker != owner || !running) return;
+                    if (props == null) {
+                        snapshot = null;
+                        artwork = null;
+                        status = "Open Spotify desktop and play a song.";
+                    } else {
+                        JsonObject meta = props.getAsJsonObject("Metadata").getAsJsonObject("data");
+                        String title = mprisText(meta, "xesam:title");
+                        if (title.isEmpty()) {
+                            snapshot = null;
+                            status = "Waiting for Spotify track information.";
+                        } else {
+                            boolean playing = "Playing".equals(props.getAsJsonObject("PlaybackStatus").get("data").getAsString());
+                            double rate = props.has("Rate") ? props.getAsJsonObject("Rate").get("data").getAsDouble() : 1;
+                            if (!Double.isFinite(rate) || rate <= 0 || rate > 4) rate = 1;
+                            long durationMs = meta.has("mpris:length") ? Math.max(0, meta.getAsJsonObject("mpris:length").get("data").getAsLong() / 1000) : 0;
+                            long positionMs = Math.max(0, props.getAsJsonObject("Position").get("data").getAsLong() / 1000);
+                            snapshot = new TrackSnapshot(title, mprisText(meta, "xesam:artist"), mprisText(meta, "xesam:album"),
+                                    durationMs, positionMs, playing, rate, System.nanoTime());
+                            status = playing ? "Connected to Spotify" : "Spotify paused";
+                            String url = mprisText(meta, "mpris:artUrl");
+                            if (artwork != null && !artwork.trackKey().equals(snapshot.key())) artwork = null;
+                            if (!url.equals(coverUrl) || (artwork == null && !url.isEmpty())) {
+                                coverUrl = url;
+                                byte[] image = fetchCover(url);
+                                if (image != null) artwork = new Artwork(snapshot.key(), image);
+                            }
+                        }
+                    }
+                }
+            } catch (IOException | RuntimeException e) {
+                if (!owner.isInterrupted()) {
+                    snapshot = null;
+                    status = "Spotify connection failed. Retrying...";
+                    LyricAirClient.LOGGER.debug("MPRIS poll failed", e);
+                }
+            } catch (InterruptedException e) { owner.interrupt(); return; }
+            try { Thread.sleep(1_000); }
+            catch (InterruptedException e) { owner.interrupt(); }
+        }
+    }
+
+    /** Returns the Player properties of Spotify, or null when Spotify is not running. */
+    private static JsonObject mprisProperties() throws IOException, InterruptedException {
+        Process child = new ProcessBuilder("busctl", "--user", "--json=short", "call", "org.mpris.MediaPlayer2.spotify",
+                "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "GetAll", "s", MPRIS_PLAYER)
+                .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+        try {
+            String output = new String(child.getInputStream().readNBytes(1_000_000), StandardCharsets.UTF_8);
+            if (!child.waitFor(5, TimeUnit.SECONDS)) return null;
+            if (child.exitValue() != 0 || output.isBlank()) return null;
+            return JsonParser.parseString(output).getAsJsonObject().getAsJsonArray("data").get(0).getAsJsonObject();
+        } finally { child.destroyForcibly(); }
+    }
+
+    private static String mprisText(JsonObject meta, String key) {
+        if (!meta.has(key)) return "";
+        var data = meta.getAsJsonObject(key).get("data");
+        if (data.isJsonArray()) {
+            StringBuilder joined = new StringBuilder();
+            for (var item : data.getAsJsonArray()) joined.append(joined.isEmpty() ? "" : ", ").append(item.getAsString());
+            return joined.toString();
+        }
+        return data.getAsString();
+    }
+
+    private static byte[] fetchCover(String url) {
+        if (!url.startsWith("https://")) return null;
+        try {
+            HttpResponse<byte[]> response = HTTP.send(HttpRequest.newBuilder(URI.create(url)).timeout(java.time.Duration.ofSeconds(10)).build(),
+                    HttpResponse.BodyHandlers.ofByteArray());
+            return response.statusCode() == 200 && response.body().length < 500_000 ? response.body() : null;
+        } catch (IOException | RuntimeException e) {
+            LyricAirClient.LOGGER.debug("Could not download cover art", e);
+            return null;
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); return null; }
     }
 
     private void accept(String line) {

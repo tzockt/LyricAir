@@ -7,3 +7,8 @@ Bring your music into Minecraft with LyricAir, a client-side Fabric mod that dis
 Watch lyrics appear, levitate, and fade throughout your world. Keep them anchored in place or let them follow your view, with adjustable colors, text size, distance, movement, and particle effects. The 2D music overlay shows album artwork, song title, artist, playback progress, and upcoming lyrics.
 
 Customize everything through a polished settings menu featuring smooth Inter fonts, live previews, color presets, RGB sliders, and draggable overlay placement.
+
+## Platform support
+
+- **Windows 10/11**: Spotify desktop playback is read through the Windows media session.
+- **Linux**: Spotify desktop playback is read through MPRIS (D-Bus) using `busctl`, which ships with systemd. Spotify has to be reachable on the session bus; this works with the native and the Flatpak version. Minecraft launchers running in a sandbox need access to the session bus.
